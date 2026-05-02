@@ -1,154 +1,61 @@
 # Stage 1
 
-## Core Actions
-1. **Fetch Notifications**: Get paginated notifications for the logged-in user.
-2. **Mark as Read**: Mark specific notifications or all notifications as read.
-3. **Receive Real-time Notifications**: Real-time push mechanism for active sessions.
+For the notifications API, we need a few basic things to get notifications and mark them as read.
 
-## REST API Endpoints
+GET /api/notifications
+Headers: Authorization: Bearer <token>
+Returns a list of notifications like this:
+[{"id": "1", "type": "Placement", "message": "hiring now", "timestamp": "2026-04-22 17:51", "isRead": false}]
 
-### 1. Get Notifications
-- **Endpoint**: `GET /api/v1/notifications`
-- **Headers**:
-  - `Authorization: Bearer <token>`
-- **Request**: none (uses query params like `?limit=10&page=1`)
-- **Response**:
-```json
-{
-  "notifications": [
-    {
-      "id": "uuid",
-      "type": "Placement",
-      "message": "CSX Corporation hiring",
-      "timestamp": "2026-04-22 17:51:18",
-      "isRead": false
-    }
-  ]
-}
-```
+PATCH /api/notifications/read
+Headers: Authorization: Bearer <token>
+Body: {"id": "1"}
+Marks the notification as read.
 
-### 2. Mark Notification as Read
-- **Endpoint**: `PATCH /api/v1/notifications/:id/read`
-- **Headers**:
-  - `Authorization: Bearer <token>`
-- **Request**:
-```json
-{
-  "isRead": true
-}
-```
-- **Response**: `200 OK`
-
-## Real-time Notifications Mechanism
-I suggest using Server-Sent Events (SSE) or WebSockets. Given notifications are mostly one-way (server to client), SSE is lightweight and perfectly suited over HTTP/2 for real-time delivery without the overhead of bidirectional WebSockets.
-
----
+For real time stuff, we can just use Server-Sent Events (SSE) or WebSockets. SSE is probably easier here since the server just needs to push data to the client and we don't need two-way communication.
 
 # Stage 2
 
-## Persistent Storage
-I suggest **PostgreSQL**. Notifications require structured relationships (User to Notifications) and strong consistency (so read statuses aren't lost). PostgreSQL handles relations well and supports JSONB if we need flexible notification payload schemas later.
+I would suggest using PostgreSQL for the DB. It handles relationships really well and we need to make sure we don't lose data about whether a notification was read.
 
-## DB Schema
-```sql
-CREATE TABLE students (
-    id SERIAL PRIMARY KEY,
-    name VARCHAR(255) NOT NULL,
-    email VARCHAR(255) UNIQUE NOT NULL
-);
+schema:
+students table: id, name, email
+notifications table: id, student_id, type, message, is_read, created_at
 
-CREATE TYPE notif_type AS ENUM ('Event', 'Result', 'Placement');
+As data grows, reading from the database will get slow. I would solve this by adding indexes on student_id and created_at. We could also archive old notifications (like older than 3 months) to a cheaper storage to keep the main table small.
 
-CREATE TABLE notifications (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    student_id INT REFERENCES students(id) ON DELETE CASCADE,
-    type notif_type NOT NULL,
-    message TEXT NOT NULL,
-    is_read BOOLEAN DEFAULT FALSE,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-);
-```
-
-## Scaling Problems and Solutions
-**Problems as data increases:**
-1. Slow read queries due to table size.
-2. Database overwhelming on heavy write bursts (e.g., notifying all 50k students).
-
-**Solutions:**
-1. **Indexing**: Add indexes on `student_id` and `created_at`.
-2. **Partitioning**: Partition the notifications table by month/year so older data doesn't slow down active queries.
-3. **Archiving**: Move notifications older than 3 months to cold storage (e.g., S3 or a cheaper DB).
-
-## Queries
-**Fetch Unread:**
-`SELECT * FROM notifications WHERE student_id = 1 AND is_read = FALSE ORDER BY created_at DESC LIMIT 10;`
-**Mark as Read:**
-`UPDATE notifications SET is_read = TRUE WHERE id = 'uuid' AND student_id = 1;`
-
----
+queries:
+fetch unread: SELECT * FROM notifications WHERE student_id = 1 AND is_read = false ORDER BY created_at DESC LIMIT 10;
 
 # Stage 3
 
-## Query Analysis
-The query is accurate but slow because it requires scanning the entire table. Filtering by `studentID` and sorting by `createdAt` on a table of 5 million rows without composite indexes leads to expensive `Seq Scans` and in-memory `filesorts`.
+The query they wrote is accurate but it will be very slow. It does a full table scan because there are 5 million rows and no indexes on those columns. 
 
-**What I would change:**
-Add a composite index on `(studentID, isRead, createdAt)`.
+To fix this, I would just add a composite index on (studentID, isRead, createdAt). 
 
-**Adding indexes on every column?**
-No, this is bad advice. Indexes speed up reads but slow down writes (INSERT/UPDATE/DELETE) because the index tree must be updated. Also, indexes consume significant disk space. Only index columns used in WHERE, JOIN, and ORDER BY clauses.
+Adding indexes on every column is a bad idea. Indexes take up a lot of disk space and they make writing to the DB (inserting/updating) slower. You should only index the columns you actually search by.
 
-## Placement Query
-```sql
-SELECT DISTINCT s.*
-FROM students s
-JOIN notifications n ON s.id = n.student_id
-WHERE n.type = 'Placement' 
-  AND n.created_at >= NOW() - INTERVAL '7 days';
-```
-
----
+Placement query for last 7 days:
+SELECT distinct s.* FROM students s JOIN notifications n ON s.id = n.student_id WHERE n.type = 'Placement' AND n.created_at >= NOW() - INTERVAL '7 days';
 
 # Stage 4
 
-## Performance Improvement
-The DB is overwhelmed by fetches on each page load.
-
-**Solution:** Implement a caching layer using **Redis**.
-1. When a user requests notifications, fetch from Redis first.
-2. If absent (cache miss), fetch from DB, store in Redis with a TTL (Time-to-Live), and return to user.
-3. When a new notification is generated, update the DB and invalidate or push to the Redis cache for that user.
-
-**Tradeoffs:**
-- **Pros**: Massively reduces DB load. Page loads are much faster.
-- **Cons**: Cache invalidation is complex. There might be eventual consistency issues (a user might see a stale notification state if the cache hasn't synced properly).
-
----
+If the DB is getting overwhelmed on every page load, we should add Redis as a cache. 
+When a student loads the page, we check Redis first. If the notifications are there, we return them quickly. If not, we query the DB, send them to the user, and save them in Redis.
+Tradeoff: sometimes the cache might have old data if we don't clear it properly when a new notification comes in.
 
 # Stage 5
 
-## Shortcomings in notify_all
-1. **Synchronous Execution**: Running `send_email` and `save_to_db` in a loop for 50,000 students synchronously will block the main thread, timeout the request, and take hours.
-2. **Lack of Fault Tolerance**: If it fails at student 200, the loop crashes. The remaining 49,800 students get nothing. We also don't know exactly who failed without parsing logs.
+The pseudocode has a few big problems. It runs synchronously, so it will take hours for 50k students. Also, if it crashes at student 200, the loop breaks and the other 49,800 students get nothing.
 
-## Redesign for Reliability and Speed
-We need an asynchronous, event-driven architecture using a Message Broker (like RabbitMQ or Kafka).
-1. The `notify_all` function quickly inserts 50,000 jobs into a Message Queue (e.g., "email_queue" and "db_queue").
-2. Background worker processes consume these queues independently. If a worker fails to send an email, the message goes back to the queue to be retried automatically.
+To make it fast and reliable, we should use a message queue like RabbitMQ. We push all 50k jobs to the queue, and background workers process them. If an email fails to send, it just goes back to the queue to try again later.
 
-## Should DB save and email happen together?
-No, they should be decoupled. Saving to the DB is fast and internal. Sending an email relies on a 3rd-party provider (SendGrid, AWS SES) which can rate limit, timeout, or fail. Separating them ensures that if the email API goes down, the in-app notification is still saved to the DB instantly.
-
----
+Also, saving to the DB and sending the email should NOT happen together. Saving to DB is very fast, but emails can fail or timeout. We should separate them so the app notification always works even if the email provider goes down.
 
 # Stage 6
 
-## Priority Inbox Approach
-For the priority inbox, we need to fetch the notifications and sort them on the fly based on two factors:
-1. **Weight**: Placement (3) > Result (2) > Event (1).
-2. **Recency**: Newer notifications score higher.
+For the priority inbox, we have to rank notifications based on their type (Placement > Result > Event) and how recent they are.
 
-**Algorithm:**
-Since we fetch the data dynamically from the API, we map each type to a base weight. To factor in recency without complex math, we can create a combined sort function. In our backend code, we first check if the weights are different. If one notification has a higher weight (e.g., Placement vs Event), it gets priority. If the weights are equal (e.g., two Placement notifications), we compare their timestamps and prioritize the most recent one. 
+My approach: When we fetch the notifications, I gave them a weight. Placement gets 3, Result gets 2, Event gets 1. We sort the array by this weight first. If the weights are equal, we check the timestamps and put the newer one first.
 
-I have implemented this functioning logic in the Express backend (`notification_app_be`). When the frontend fetches `/api/notifications/priority`, the backend pulls from the Evaluation Server, calculates the priorities, sorts the array, slices the top 10, and returns them to the React frontend.
+I wrote this logic in the backend code. It fetches all the notifications, sorts them using this rule, and then just slices the top 10 and sends them to the frontend to be displayed.
