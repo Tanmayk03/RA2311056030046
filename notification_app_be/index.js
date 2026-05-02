@@ -1,6 +1,6 @@
 import express from 'express';
 import cors from 'cors';
-import { Log, ACCESS_TOKEN } from 'logging_middleware';
+import { Log, getToken } from 'logging_middleware';
 
 const app = express();
 app.use(cors());
@@ -11,10 +11,15 @@ app.get('/api/notifications/priority', async (req, res) => {
     try {
         await Log('backend', 'info', 'controller', 'Fetching priority notifications');
         
+        const token = await getToken();
+        if (!token) {
+            return res.status(500).json({ error: 'Failed to authenticate with evaluation server' });
+        }
+
         const response = await fetch('http://20.207.122.201/evaluation-service/notifications', {
             method: 'GET',
             headers: {
-                'Authorization': `Bearer ${ACCESS_TOKEN}`
+                'Authorization': `Bearer ${token}`
             }
         });
 
